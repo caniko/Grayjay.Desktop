@@ -1,5 +1,7 @@
 ﻿using Grayjay.ClientServer.Casting;
 using Grayjay.ClientServer.Proxy;
+using Grayjay.ClientServer.Sabr.Cast;
+using Grayjay.Engine.Models.Video.Sources;
 using Grayjay.ClientServer.States;
 using Grayjay.Desktop.POC;
 using Microsoft.AspNetCore.Mvc;
@@ -40,17 +42,12 @@ namespace Grayjay.ClientServer.Controllers
         {
             var instance = GrayjayCastingServer.Instance; //TODO: Make a nicer way to ensure the instance gets created
 
-            CastingDevice? castingDevice;
-            var pinnedDeviceInfo = StateCasting.Instance.PinnedDevices.FirstOrDefault(x => x.Id == id);
-            if (pinnedDeviceInfo != null)
+            CastingDevice? castingDevice = StateCasting.Instance.DiscoveredDevices.FirstOrDefault(x => x.DeviceInfo.Id == id);
+            if (castingDevice == null)
             {
-                castingDevice = StateCasting.Instance.CreateDevice(pinnedDeviceInfo);
-            }
-            else
-            {
-                castingDevice = StateCasting.Instance.DiscoveredDevices.FirstOrDefault(x => x.DeviceInfo.Id == id);
-                if (castingDevice != null)
-                    StateCasting.Instance.PinnedDevices.Add(castingDevice.DeviceInfo);
+                var pinnedDeviceInfo = StateCasting.Instance.PinnedDevices.FirstOrDefault(x => x.Id == id);
+                if (pinnedDeviceInfo != null)
+                    castingDevice = StateCasting.Instance.CreateDevice(pinnedDeviceInfo);
             }
 
             if (castingDevice != null)
@@ -64,6 +61,7 @@ namespace Grayjay.ClientServer.Controllers
         [HttpGet]
         public IActionResult Disconnect()
         {
+            UmpCasting.Stop();
             StateCasting.Instance.Disconnect();
             return Ok();
         }
@@ -80,6 +78,7 @@ namespace Grayjay.ClientServer.Controllers
         [HttpGet]
         public async Task<ActionResult> MediaStop(CancellationToken cancellationToken)
         {
+            UmpCasting.Stop();
             Task? task = StateCasting.Instance.ActiveDevice?.MediaStopAsync(cancellationToken);
             if (task != null)
                 await task;
@@ -113,6 +112,16 @@ namespace Grayjay.ClientServer.Controllers
 
             //TODO: Uncomment
             //var proxyInnerSources = activeDevice is FCastCastingDevice ? false : true;
+            (var castVideo, _, _) = DetailsController.GetSources(this.State(), videoIndex, audioIndex, subtitleIndex, videoIsLocal, audioIsLocal, subtitleIsLocal);
+            if (castVideo is UMPSource umpSource)
+            {
+                var ump = await UmpCasting.PrepareAsync(this.State(), umpSource, activeDevice, resumePosition, subtitleIndex, subtitleIsLocal, this.State().DetailsState.UmpCastHeight, title, thumbnailUrl);
+                Logger.i(nameof(CastingController), $"Started UMP casting '{ump.Url}'.");
+                await UmpCasting.LoadAsync(activeDevice, ump, title, thumbnailUrl, speed, cancellationToken);
+                return Ok();
+            }
+
+            UmpCasting.Stop();
             var shouldProxy =
                 (activeDevice is FCastCastingDevice || (activeDevice is CastingDeviceExperimentalWrapper expDevice && expDevice.inner.CastingProtocol() == FCast.SenderSDK.ProtocolType.FCast))
                 ? false : true;
@@ -125,6 +134,20 @@ namespace Grayjay.ClientServer.Controllers
             Task? task = StateCasting.Instance.ActiveDevice?.MediaLoadAsync(streamType, sourceDescriptor.Type, sourceDescriptor.Url, TimeSpan.FromSeconds(resumePosition), TimeSpan.FromSeconds(duration), title, thumbnailUrl, speed, cancellationToken);
             if (task != null)
                 await task;
+            return Ok();
+        }
+
+        [HttpGet]
+        public ActionResult<UmpCasting.QualityOptions?> UmpCastQualities()
+        {
+            return Ok(UmpCasting.GetQualityOptions());
+        }
+
+        [HttpGet]
+        public async Task<ActionResult> SetUmpCastQuality(int height)
+        {
+            this.State().DetailsState.UmpCastHeight = height;
+            await UmpCasting.ChangeQualityAsync(height);
             return Ok();
         }
 

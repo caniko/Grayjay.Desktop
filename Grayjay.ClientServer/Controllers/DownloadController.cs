@@ -43,8 +43,9 @@ namespace Grayjay.ClientServer.Controllers
                 _details = details;
                 _sources = new DownloadSources()
                 {
-                    VideoSources = VideoHelper.ReorderVideoSources(details.Video.VideoSources.Where(x=>x.IsDownloadable()).ToList(), (details.Video is UnMuxedVideoDescriptor unmux && (unmux.AudioSources?.Any(x=>x.IsDownloadable()) ?? false))),
-                    AudioSources = VideoHelper.ReorderAudioSources(((details.Video is UnMuxedVideoDescriptor unmux2) ? unmux2.AudioSources.Where(x=>x.IsDownloadable()).ToList() : new List<IAudioSource>())),
+                    VideoSources = VideoHelper.ReorderVideoSources(VideoHelper.ExpandUMPVideoSources(details.Video.VideoSources).Where(x=>x.IsDownloadable()).ToList(), (details.Video is UnMuxedVideoDescriptor unmux && (unmux.AudioSources?.Any(x=>x.IsDownloadable()) ?? false)) || details.Video.VideoSources.Any(x => x is UMPSource)),
+                    AudioSources = VideoHelper.ReorderAudioSources(((details.Video is UnMuxedVideoDescriptor unmux2) ? unmux2.AudioSources.Where(x=>x.IsDownloadable()).ToList() : new List<IAudioSource>())
+                        .Concat(VideoHelper.GetUMPAudioSources(details.Video.VideoSources).Where(x => x.IsDownloadable())).ToList()),
                     SubtitleSources = details.Subtitles.ToList(),
                     ManifestSources = details.Video.VideoSources.Where(x => x is HLSManifestSource)
                         .ToDictionary(x => Array.IndexOf(details.Video.VideoSources, x), y =>
@@ -225,7 +226,7 @@ namespace Grayjay.ClientServer.Controllers
                 throw DialogException.FromException("Export not supported in server-mode", new Exception("For export support, run the application in ui mode, server support might be added at a later time"));
 
             var downloads = ids.Select(x => StateDownloads.GetDownloadedVideo(x))
-                .Where(x=>x.Video != null)
+                .Where(x=>x?.Video != null)
                 .ToArray();
             if(downloads.Length > 0)
             {
@@ -289,8 +290,9 @@ namespace Grayjay.ClientServer.Controllers
                             FFMPEG.ExecuteSafe(args);
                         }
                     }
+                    return ExportsFinished(downloads, outputFolder);
                 }
-                return ExportsFinished(downloads, outputFolder);
+                return Ok();
             }
             return NotFound();
         }

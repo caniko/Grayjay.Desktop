@@ -1,4 +1,4 @@
-import { createEffect, createMemo, type Component } from 'solid-js';
+import { Show, createEffect, createMemo, type Component } from 'solid-js';
 import LoaderContainer from '../basics/loaders/LoaderContainer';
 import NavigationBar from '../topbars/NavigationBar';
 import styles from './index.module.css';
@@ -16,13 +16,15 @@ import { focusable } from '../../focusable'; void focusable;
 import { IPlatformContent } from '../../backend/models/content/IPlatformContent';
 import IconButton from '../buttons/IconButton';
 
+export type RemotePlaylistAction = "playAll" | "shuffle" | { url: string, index?: number };
+
 interface RemotePlaylistDetailViewProps {
   type: string;
   name?: string;
   itemCount?: number;
   pager?: Pager<IPlatformContent>;
   isLoading: boolean;
-  onInteract?: () => void;
+  onInteract?: (action?: RemotePlaylistAction) => void;
 }
 
 const RemotePlaylistDetailView: Component<RemotePlaylistDetailViewProps> = (props) => {
@@ -52,7 +54,9 @@ const RemotePlaylistDetailView: Component<RemotePlaylistDetailViewProps> = (prop
         <div style="display: flex; flex-direction: row; align-items: center; margin-left: 32px; margin-right: 32px; margin-top: 46px; margin-bottom: 16px; gap: 16px;">
           <div style="display: flex; flex-direction: column;">
             <div class={styles.header}>{props.name}</div>
-            <div class={styles.metadata}>{props.itemCount ?? 0} {props.itemCount === 1 ? "item" : "items"}</div>
+            <Show when={(props.itemCount ?? 0) >= 0}>
+              <div class={styles.metadata}>{props.itemCount ?? 0} {props.itemCount === 1 ? "item" : "items"}</div>
+            </Show>
           </div>
           <div style="flex-grow: 1"></div>
             <CustomButton
@@ -62,12 +66,12 @@ const RemotePlaylistDetailView: Component<RemotePlaylistDetailViewProps> = (prop
               background: "linear-gradient(267deg, #01D6E6 -100.57%, #0182E7 90.96%)",
               "flex-shrink": 0
             }}
-            onClick={() => props?.onInteract?.()}
+            onClick={() => props?.onInteract?.("playAll")}
             focusableOpts={{
               groupId: 'actions',
               groupType: 'horizontal',
               groupIndices: [1],
-              onPress: () => props?.onInteract?.()
+              onPress: () => props?.onInteract?.("playAll")
             }} />
           <CustomButton
             text="Shuffle"
@@ -76,12 +80,12 @@ const RemotePlaylistDetailView: Component<RemotePlaylistDetailViewProps> = (prop
               border: "1px solid #2E2E2E",
               "flex-shrink": 0
             }}
-            onClick={() => props?.onInteract?.()}
+            onClick={() => props?.onInteract?.("shuffle")}
             focusableOpts={{
               groupId: 'actions',
               groupType: 'horizontal',
               groupIndices: [2],
-              onPress: () => props?.onInteract?.()
+              onPress: () => props?.onInteract?.("shuffle")
             }} />
           <IconButton
             icon={iconSettings}
@@ -114,7 +118,7 @@ const RemotePlaylistDetailView: Component<RemotePlaylistDetailViewProps> = (prop
                 <PlaylistItemView item={item() as IPlatformVideo} 
                   onRemove={() => props?.onInteract?.()} 
                   onSettings={(el) => props?.onInteract?.()} 
-                  onPlay={() => props?.onInteract?.()}
+                  onPlay={() => props?.onInteract?.({ url: (item() as IPlatformVideo).url, index: index() })}
                   focusableOpts={{
                     groupId: 'playlist',
                     groupType: 'vertical',
@@ -122,7 +126,7 @@ const RemotePlaylistDetailView: Component<RemotePlaylistDetailViewProps> = (prop
                     groupEscapeTo: {
                       up: ['actions']
                     },
-                    onPress: () => props?.onInteract?.()
+                    onPress: () => props?.onInteract?.({ url: (item() as IPlatformVideo).url, index: index() })
                   }} />
               );
             }} />

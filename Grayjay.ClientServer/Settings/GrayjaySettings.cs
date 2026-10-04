@@ -204,10 +204,11 @@ namespace Grayjay.ClientServer.Settings
             }*/
 
 
-            /*
             [SettingsField("Live Chat Webview", SettingsField.TOGGLE, "Use the live chat web window when available over the native window", 9)]
             public bool UseLiveChatWindow { get; set; } = true;
-            */
+
+            [SettingsField("Native UMP Playback", SettingsField.TOGGLE, "Allow plugins to provide native UMP (SABR) streams. Plugins may need a reload after changing this.", 10)]
+            public bool NativeUmp { get; set; } = true;
 
             //[SettingsField("Hide Known Broken Livechats", SettingsField.TOGGLE, "Some live chats are known to have compatibility issues with desktop, this setting disables those (Recommended)", 7)]
             //public bool HideBrokenLivechats { get; set; } = true;
@@ -335,6 +336,15 @@ namespace Grayjay.ClientServer.Settings
 
             [SettingsField("Plugin Updates", SettingsField.TOGGLE, "Enable plugin update notifications", 0)]
             public bool PluginUpdates { get; set; } = true;
+        }
+
+        [SettingsField("Browser", SettingsField.GROUP, "Configure the embedded browser", 12)]
+        public BrowserSettings Browser { get; set; } = new BrowserSettings();
+        public class BrowserSettings
+        {
+            [SettingsField("Disable Sandbox", SettingsField.TOGGLE, "Linux only. Run the embedded browser without the Chromium sandbox. Only use this if pages crash or stay blank. Requires restart", 0)]
+            [SettingsAdvanced]
+            public bool DisableSandbox { get; set; } = false;
         }
 
         [SettingsField("Info", SettingsField.GROUP, "", 13)]

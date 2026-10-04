@@ -7,6 +7,7 @@ using Grayjay.ClientServer.Models;
 using Grayjay.ClientServer.Models.Downloads;
 using Grayjay.ClientServer.Pagers;
 using Grayjay.ClientServer.Proxy;
+using Grayjay.ClientServer.Sabr;
 using Grayjay.ClientServer.Settings;
 using Grayjay.ClientServer.States;
 using Grayjay.ClientServer.Subscriptions;
@@ -53,7 +54,8 @@ namespace Grayjay.ClientServer.Controllers
             public DBHistoryIndex VideoHistoryIndex { get; set; }
             public PlaybackTracker VideoPlaybackTracker { get; set; }
 
-            public HttpProxyRegistryEntry _liveChatProxy = null;
+            public string? UmpPlaybackId { get; set; }
+            public int UmpCastHeight { get; set; } = -1;
 
             public RequestExecutor _videoRequestExecutor = null;
             public RequestExecutor _audioRequestExecutor = null;
@@ -117,10 +119,19 @@ namespace Grayjay.ClientServer.Controllers
                 }
             }
 
+            public void ReleaseUmpPlayback()
+            {
+                var id = UmpPlaybackId;
+                UmpPlaybackId = null;
+                if (id != null)
+                    UmpPlaybackRegistry.Release(id);
+            }
+
             public void Dispose()
             {
                 LiveChatManager?.Stop();
                 LiveChatManager = null;
+                ReleaseUmpPlayback();
             }
         }
 
@@ -131,6 +142,8 @@ namespace Grayjay.ClientServer.Controllers
             var state = this.State().DetailsState;
             video = video ?? videoLocal;
             state.ClearCachedDash();
+            state.ReleaseUmpPlayback();
+            state.UmpCastHeight = -1;
             state.VideoLoaded = video;
             state.VideoLocal = videoLocal;
             state.VideoSubscription = StateSubscriptions.GetSubscription(video?.Author?.Url ?? videoLocal?.Author?.Url);
@@ -446,151 +459,23 @@ namespace Grayjay.ClientServer.Controllers
         }
 
 
+        [HttpPost]
+        public async Task ConfigureLiveChatView(int viewId, [FromBody] LiveChatWindowDescriptor descriptor)
+        {
+            if (!GrayjaySettings.Instance.Playback.UseLiveChatWindow || StateApp.MainWindow == null)
+                throw new InvalidOperationException("Live chat webview is disabled or unavailable.");
+            await StateApp.MainWindow.ConfigureLiveChatViewAsync(viewId, descriptor);
+        }
+
         [HttpGet]
-        public async Task<LiveChatWindowDescriptor?> GetLiveChatWindow()
+        public LiveChatWindowDescriptor? GetLiveChatWindow()
         {
             var video = EnsureVideo(this.State());
-            if (!video.IsLive)
+            if (!video.IsLive || !GrayjaySettings.Instance.Playback.UseLiveChatWindow)
                 return null;
 
-            var window = StatePlatform.GetLiveChatWindow(video.Url);
-            if(window == null || string.IsNullOrEmpty(window.Url) || !string.IsNullOrEmpty(window.Error))
-            {
-                return window;
-            }
-            var httpProxy = HttpProxy.Get(true);
-            var liveChatProxyEntry = new HttpProxyRegistryEntry()
-            {
-                Url = window.Url,
-                FollowRedirects = false,
-                SupportRelativeProxy = true,
-                RequestHeaderOptions = new RequestHeaderOptions()
-                {
-                    HeadersToInject = new Dictionary<string, string>()
-                    {
-                        { "user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" }
-                    }
-                },
-                ResponseHeaderOptions = new ResponseHeaderOptions()
-                {
-                    HeadersToInject = new Dictionary<string, string>()
-                    {
-                        { "x-frame-options", "ALLOWALL" },
-                    },
-                }
-            };
-            //TODO: Fix ModifyResponse
-            string iframeId = Guid.NewGuid().ToString();
-            liveChatProxyEntry.WithModifyResponseString((resp, str) =>
-            {
-                return ModifyLiveChatResponse(window, str);
-            });
-            var state = this.State().DetailsState;
-
-            var oldProxy = state._liveChatProxy;
-            if (oldProxy != null)
-                httpProxy.Remove(oldProxy.Id);
-            state._liveChatProxy = liveChatProxyEntry;
-            //TODO: Proper urls
-
-            var uiWindow = StateApp.MainWindow;
-            if(uiWindow != null)
-            {
-                await uiWindow.SetRequestProxyAsync(window.Url, async (req) =>
-                {
-                    using (HttpClient client = new HttpClient())
-                    {
-                        foreach (var header in req.Headers)
-                            client.DefaultRequestHeaders.Add(header.Key, header.Value);
-                        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-
-                        var request = new HttpRequestMessage(HttpMethod.Get, window.Url);
-                        request.Version = HttpVersion.Version11;
-                        request.VersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
-                        var resp = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead);
-                        var resultHeaders = resp.Headers.ToDictionary(x => x.Key, y => y.Value.ToList(), StringComparer.OrdinalIgnoreCase);
-                        if (resp.Content != null)
-                        {
-                            foreach (var pair in resp.Content.Headers)
-                            {
-                                if (resultHeaders.TryGetValue(pair.Key, out var v))
-                                    v.AddRange(pair.Value);
-                                else
-                                    resultHeaders[pair.Key] = pair.Value.ToList();
-                            }
-                        }
-                        if (resultHeaders.ContainsKey("x-frame-options"))
-                            resultHeaders["x-frame-options"] = new List<string>(["ALLOWALL"]);
-                        else
-                            resultHeaders.Add("x-frame-options", new List<string>(["ALLOWALL"]));
-
-
-                        string data = await resp.Content!.ReadAsStringAsync();
-                        data = ModifyLiveChatResponse(window, data);
-
-                        var bytes = Encoding.UTF8.GetBytes(data);
-                        resultHeaders["Content-Length"] = new List<string>([bytes.Length.ToString()]);
-                        resultHeaders["Content-Type"] = new List<string>(["text/html"]);
-
-                        return new WindowResponse()
-                        {
-                            Headers = resultHeaders,
-                            StatusCode = (int)resp.StatusCode,
-                            StatusText = resp.StatusCode.ToString(),
-                            BodyStream = new MemoryStream(bytes)
-                        };
-                    }
-                });
-            }
-            else
-            {
-                window.Url = httpProxy.Add(liveChatProxyEntry)!.Replace("127.0.0.1", "localhost");
-            }
-
-                return window;
+            return StatePlatform.GetLiveChatWindow(video.Url);
         }
-
-        private string ModifyLiveChatResponse(LiveChatWindowDescriptor window, string str)
-        {
-
-            if (!str.Contains("</body>"))
-                return str;
-            List<string> js = new List<string>();
-            if (window.RemoveElements != null)
-            {
-                foreach (var element in window.RemoveElements)
-                {
-                    js.Add($"console.log('Removing [' + {JsonConvert.SerializeObject(element)} + ']')");
-                    js.Add($"document.querySelectorAll({JsonConvert.SerializeObject(element)}).forEach(x=>x.remove())");
-                }
-            }
-            if (window.RemoveElementsInterval != null)
-            {
-                StringBuilder builder = new StringBuilder();
-                foreach (var element in window.RemoveElementsInterval)
-                {
-                    builder.AppendLine($"document.querySelectorAll({JsonConvert.SerializeObject(element)}).forEach(x=>x.remove())");
-                }
-                js.Add("setInterval(()=>{\n" + builder.ToString() + "}, 1000)");
-            }
-
-            if (js.Count == 0)
-                return str;
-
-            string toInject = string.Join("\n", js);
-
-            str = new BrowserSimulatorBuilder()
-                //.WithLocation(window.Url)
-                .WithNavigatorValue("webdriver", "false")
-                .HideGetOwnProptyDescriptos("webdriver")
-                .InjectHtml(str);
-
-            return str
-                .Replace("</body>", "<script>(()=>{\n"
-                    + toInject
-                    + "\n})()</script></body>");
-        }
-
 
         [HttpGet]
         public List<Chapter> GetVideoChapters(string url)
@@ -626,6 +511,8 @@ namespace Grayjay.ClientServer.Controllers
         {
             var video = (videoIndex == -999) ? EnsureVideo(this.State()).Live :
                 EnsureVideo(this.State()).Video.VideoSources[videoIndex];
+            if (video is UMPSource)
+                return new List<VideoQuality>();
             if(video is HLSManifestSource hlsVideo)
             {
                 var hlsResponse = _qualityClient.GET(hlsVideo.Url, new Engine.Models.HttpHeaders());
@@ -1174,6 +1061,9 @@ namespace Grayjay.ClientServer.Controllers
         {
             var video = EnsureVideo(state);
 
+            if (videoIndex == -999 && video.Live is UMPSource liveUmp && (proxySettings?.IsLoopback ?? true))
+                return UmpSourceDescriptor(state, liveUmp, videoIndex, subtitleIndex, subtitleIsLocal, tag);
+
             if (videoIndex == -999)
             {
                 if (video.Live == null)
@@ -1194,6 +1084,12 @@ namespace Grayjay.ClientServer.Controllers
             }
 
             (var sourceVideo, var sourceAudio, var sourceSubtitle) = GetSources(state, videoIndex, audioIndex, subtitleIndex, videoIsLocal, audioIsLocal, subtitleIsLocal);
+            if (sourceVideo is UMPSource umpSource)
+            {
+                if (proxySettings?.IsLoopback ?? true)
+                    return UmpSourceDescriptor(state, umpSource, videoIndex, subtitleIndex, subtitleIsLocal, tag);
+                throw new InvalidOperationException("UMP sources are cast through UmpCasting, not the source proxy");
+            }
             if (subtitleIndex >= 0 && sourceVideo is HLSManifestSource)
                 return DirectHLSUrlSource(state, videoIndex, -1, subtitleIndex, subtitleIsLocal, proxySettings ?? new ProxySettings(true), null);
 
@@ -1266,6 +1162,21 @@ namespace Grayjay.ClientServer.Controllers
                     CanRetry = false
                 });
             //throw new Exception("Select either a videoIndex or audioIndex");
+        }
+
+        public static SourceDescriptor UmpSourceDescriptor(WindowState state, UMPSource source, int videoIndex, int subtitleIndex, bool subtitleIsLocal, string? tag)
+        {
+            var details = state.DetailsState;
+            var previous = details.UmpPlaybackId != null ? UmpPlaybackRegistry.Get(details.UmpPlaybackId) : null;
+            var continued = previous != null && previous.Source.VideoId == source.VideoId && previous.Source.Url == source.Url && previous.Session.FatalError == null && !previous.Session.IsReleased
+                ? previous.Session.ExportTransferable() : null;
+            details.ReleaseUmpPlayback();
+            var playback = UmpPlaybackRegistry.Create(state.WindowID, source, continued == null ? Sabr.Cast.UmpCasting.TakeHandBackState(source.VideoId ?? "") : null, continued);
+            playback.Tag = tag;
+            if (subtitleIndex >= 0)
+                playback.SubtitleUrl = $"/details/Subtitle?subtitleIndex={subtitleIndex}&subtitleIsLocal={subtitleIsLocal}&windowId={state.WindowID}";
+            details.UmpPlaybackId = playback.Id;
+            return new SourceDescriptor($"/Ump/Info?id={playback.Id}", UMPSource.CONTAINER, videoIndex, -1, subtitleIndex, false, false, subtitleIsLocal);
         }
 
         private static readonly Regex _repIdRegex = new Regex("Representation\\s+id=\"(\\d+)\"", RegexOptions.Compiled);
@@ -1369,10 +1280,10 @@ namespace Grayjay.ClientServer.Controllers
             var executor = (sourceVideo.HasRequestExecutor) ? sourceVideo.GetRequestExecutor() : null;
 
             var videoUrl = proxySettings != null && proxySettings.Value.ShouldProxySources(sourceVideo, null) ? WebUtility.HtmlEncode(HttpProxy.Get(proxySettings.Value.IsLoopback).Add(new HttpProxyRegistryEntry()
-            {   
+            {
                 RequestModifier = modifier?.ToProxyFunc(),
                 Url = (sourceVideo as VideoUrlSource).Url
-            })) : sourceVideo.Url;
+            }, proxySettings.Value.ProxyAddress)) : sourceVideo.Url;
             return new SourceDescriptor(videoUrl, sourceVideo.Container)
             {
                 VideoIndex = index,
@@ -1388,7 +1299,7 @@ namespace Grayjay.ClientServer.Controllers
             {
                 RequestModifier = modifier?.ToProxyFunc(),
                 Url = (sourceAudio as AudioUrlSource).Url
-            })) : sourceAudio.Url;
+            }, proxySettings.Value.ProxyAddress)) : sourceAudio.Url;
             return new SourceDescriptor(audioUrl, sourceAudio.Container)
             {
                 AudioIndex = index,
@@ -1549,6 +1460,12 @@ namespace Grayjay.ClientServer.Controllers
         }
 
         public static async Task<(byte[] Bytes, string ContentType)> GetSubtitleBytesAsync(WindowState state, int subtitleIndex, bool subtitleIsLocal, string? modifierId = null)
+        {
+            var (bytes, contentType) = await GetRawSubtitleBytesAsync(state, subtitleIndex, subtitleIsLocal, modifierId);
+            return (VttHelper.IsVtt(contentType, bytes) ? VttHelper.StripUnsupportedTags(bytes) : bytes, contentType);
+        }
+
+        private static async Task<(byte[] Bytes, string ContentType)> GetRawSubtitleBytesAsync(WindowState state, int subtitleIndex, bool subtitleIsLocal, string? modifierId)
         {
             if (subtitleIsLocal)
             {

@@ -6,6 +6,7 @@ using Grayjay.ClientServer.Settings;
 using Grayjay.ClientServer.States;
 using Grayjay.Desktop.CEF;
 using Grayjay.Engine.Packages;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -25,32 +26,8 @@ namespace Grayjay.Desktop
         private const string PortFileName = "port";   
         private const int StartupTimeoutSeconds = 5;
         private const int NewWindowTimeoutSeconds = 5;
-
-        private static void EnsureCefLibraryPath()
-        {
-            if (!OperatingSystem.IsLinux())
-                return;
-
-            string? cefDirectory = Utilities.FindDirectory("cef");
-            if (string.IsNullOrEmpty(cefDirectory))
-            {
-                Logger.w(nameof(Program), "Unable to locate the CEF directory");
-                return;
-            }
-
-            string? currentPath = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH");
-            string[] paths = string.IsNullOrEmpty(currentPath)
-                ? Array.Empty<string>()
-                : currentPath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
-
-            if (!paths.Contains(cefDirectory, StringComparer.Ordinal))
-            {
-                string updatedPath = string.IsNullOrEmpty(currentPath)
-                    ? cefDirectory
-                    : cefDirectory + Path.PathSeparator + currentPath;
-                Environment.SetEnvironmentVariable("LD_LIBRARY_PATH", updatedPath);
-            }
-        }
+        private static readonly TimeSpan SandboxedReadyTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan TimedOutProcessExitDelay = TimeSpan.FromSeconds(6);
 
         private static bool IsProcessRunningByPath(string path, out Process? matchingProcess)
         {
@@ -123,6 +100,145 @@ namespace Grayjay.Desktop
             }
 
             Logger.i(nameof(Program), $"KillExistingProcessByPath duration {sw.ElapsedMilliseconds}ms");
+        }
+
+        private static string? FindSystemWidevineCdm()
+        {
+            if (!OperatingSystem.IsLinux())
+                return null;
+
+            string[] candidates =
+            {
+                "/opt/google/chrome/WidevineCdm",
+                "/opt/google/chrome-beta/WidevineCdm",
+                "/opt/google/chrome-unstable/WidevineCdm",
+                "/opt/microsoft/msedge/WidevineCdm",
+                "/usr/lib/chromium/WidevineCdm",
+                "/usr/lib64/chromium/WidevineCdm"
+            };
+
+            foreach (var candidate in candidates)
+            {
+                if (File.Exists(Path.Combine(candidate, "manifest.json")))
+                    return candidate;
+            }
+
+            return null;
+        }
+
+        private static async Task<JustCefProcess> StartCefProcessAsync(string startArgs, Action<JustCefProcess>? configure = null, TimeSpan? readyTimeout = null)
+        {
+            const int maxAttempts = 3;
+
+            for (int attempt = 1; ; attempt++)
+            {
+                var cef = new JustCefProcess();
+                try
+                {
+                    configure?.Invoke(cef);
+                    cef.Start(startArgs);
+                    await WaitForReadyAsync(cef, readyTimeout);
+                    return cef;
+                }
+                catch (JustCefStartupException e) when (e.Failure != JustCefStartupFailure.Unknown && attempt < maxAttempts)
+                {
+                    Logger.w(nameof(Program), $"JustCef startup attempt {attempt} failed ({e.Failure}), retrying.", e);
+                    cef.Dispose();
+                    await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt));
+                }
+                catch
+                {
+                    cef.Dispose();
+                    throw;
+                }
+            }
+        }
+
+        private static async Task<JustCefProcess> StartCefProcessWithSandboxFallbackAsync(string startArgs, bool canFallback, string rootCachePath)
+        {
+            if (!canFallback)
+                return await StartCefProcessAsync(startArgs);
+
+            try
+            {
+                return await StartCefProcessAsync(startArgs, cef => LinuxSandbox.ConfigureProcess(cef, rootCachePath), SandboxedReadyTimeout);
+            }
+            catch (JustCefStartupException e) when (e.Failure == JustCefStartupFailure.Unknown)
+            {
+                Logger.w(nameof(Program), $"JustCef failed to start with the sandbox enabled (exit code {e.ExitCode}), retrying without the sandbox.", e);
+            }
+            catch (TimeoutException e)
+            {
+                Logger.w(nameof(Program), "JustCef did not become ready with the sandbox enabled, retrying without the sandbox.", e);
+                await Task.Delay(TimedOutProcessExitDelay);
+            }
+            catch (Win32Exception e)
+            {
+                Logger.w(nameof(Program), "JustCef could not be launched with the sandbox enabled, retrying without the sandbox.", e);
+            }
+
+            var cef = await StartCefProcessAsync("--no-sandbox " + startArgs);
+            LinuxSandbox.MarkFailed();
+            return cef;
+        }
+
+        private static async Task WaitForReadyAsync(JustCefProcess cef, TimeSpan? timeout)
+        {
+            if (timeout == null)
+            {
+                await cef.WaitForReadyAsync();
+                return;
+            }
+
+            using var cts = new CancellationTokenSource(timeout.Value);
+            try
+            {
+                await cef.WaitForReadyAsync(cts.Token);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                throw new TimeoutException($"JustCef did not become ready within {timeout.Value.TotalSeconds} seconds.");
+            }
+        }
+
+        private static async Task MonitorWidevineAsync(JustCefProcess cef)
+        {
+            try
+            {
+                bool everRegistered = false;
+
+                for (int i = 0; i < 12; i++)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5));
+
+                    var status = await cef.GetWidevineStatusAsync();
+                    everRegistered |= status.Registered;
+
+                    if (!status.Installed)
+                        continue;
+
+                    if (!status.RequiresRestart)
+                    {
+                        Logger.i(nameof(Program), $"Widevine CDM {status.Version} is active.");
+                        return;
+                    }
+
+                    Logger.i(nameof(Program), $"Widevine CDM {status.Version} was installed and takes effect after a restart.");
+
+                    await StateWindow.WaitForReadyAsync();
+                    StateUI.Toast("Protected playback", "Restart Grayjay to finish enabling playback of protected content.");
+                    return;
+                }
+
+                if (everRegistered)
+                    Logger.i(nameof(Program), "The Widevine CDM did not install, protected content will not play.");
+                else
+                    Logger.i(nameof(Program), "Widevine is unavailable on this platform, protected content will not play.");
+            }
+            catch (Exception e)
+            {
+                Logger.w(nameof(Program), "Failed to query the Widevine status.", e);
+            }
         }
 
         private static async Task<bool> TryOpenWindow()
@@ -265,6 +381,14 @@ namespace Grayjay.Desktop
         {
             Stopwatch sw = Stopwatch.StartNew();
 
+#if DEBUG
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && WindowsAPI.AllocConsole())
+            {
+                Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+                Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+            }
+#endif
+
             if (args.Length > 0 && args[0] == "version")
             {
                 Console.WriteLine(App.Version.ToString());
@@ -278,10 +402,6 @@ namespace Grayjay.Desktop
             double? scaleFactor = args?.FirstOrDefault(a => a.StartsWith("--scale-factor=")) is string s && double.TryParse(s["--scale-factor=".Length..], out var v) ? v : null;
             StateApp.InputSource = args?.FirstOrDefault(a => a.StartsWith("--input-source="))?["--input-source=".Length..];
 
-#if DEBUG
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                WindowsAPI.AllocConsole();
-#endif
             if (isHeadless || isServer)
             {
                 if (disableSecurity)
@@ -406,27 +526,48 @@ namespace Grayjay.Desktop
                 }
             }
 
-            using var cef = !isServer ? new JustCefProcess() : null;
-            if (cef != null)
+            string cefStartArgs = "";
+            string rootCachePath = Path.Combine(Directories.Base, "cef_cache");
+            bool useSandbox = true;
+            if (!isServer)
             {
-                EnsureCefLibraryPath();
-                PackageBrowser.Process = cef;
-                Stopwatch startWindowWatch = Stopwatch.StartNew();
                 var extraArgs = ReconstructArgs(args);
                 Logger.i(nameof(Program), "Extra args: " + extraArgs);
 
-                string userDataDirCmd = "--user-data-dir=\"" + Path.Combine(Directories.Temporary, "chrome_" + Guid.NewGuid().ToString()) + "\" ";
-                Logger.i(nameof(Program), "Main: Starting JustCefProcess");
-                if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
-                    cef.Start("--use-alloy-style --use-native " + userDataDirCmd + extraArgs);
-                else
+                string rootCacheDirCmd = "--root-cache-path=\"" + rootCachePath + "\" ";
+                Logger.i(nameof(Program), "Root cache path: " + rootCachePath);
+
+                string? systemCdmPath = FindSystemWidevineCdm();
+                if (systemCdmPath != null)
                 {
-                    if (Environment.GetEnvironmentVariable("WAYLAND_DISPLAY") != null)
-                        cef.Start("--no-sandbox " + userDataDirCmd + extraArgs);
-                    else
-                        cef.Start("--use-alloy-style --use-native --no-sandbox " + userDataDirCmd + extraArgs);
+                    Logger.i(nameof(Program), "Found a system Widevine CDM at " + systemCdmPath);
+                    rootCacheDirCmd += "--widevine-cdm-path=\"" + systemCdmPath + "\" ";
                 }
-                Logger.i(nameof(Program), $"Main: Starting JustCefProcess finished ({startWindowWatch.ElapsedMilliseconds}ms)");
+
+                if (OperatingSystem.IsLinux())
+                    useSandbox = LinuxSandbox.ShouldUse(args);
+                string sandboxArg = useSandbox ? "" : "--no-sandbox ";
+
+                if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+                    cefStartArgs = "--use-alloy-style --use-native " + rootCacheDirCmd + extraArgs;
+                else if (Environment.GetEnvironmentVariable("WAYLAND_DISPLAY") != null)
+                    cefStartArgs = sandboxArg + rootCacheDirCmd + extraArgs;
+                else
+                    cefStartArgs = "--use-alloy-style --use-native " + sandboxArg + rootCacheDirCmd + extraArgs;
+
+                Logger.i(nameof(Program), "Main: Starting JustCefProcess");
+            }
+
+            Stopwatch startCefWatch = Stopwatch.StartNew();
+            using var cef = !isServer ? await StartCefProcessWithSandboxFallbackAsync(cefStartArgs, OperatingSystem.IsLinux() && useSandbox, rootCachePath) : null;
+            if (cef != null)
+            {
+                PackageBrowser.Process = cef;
+                Logger.i(nameof(Program), $"Main: Starting JustCefProcess finished ({startCefWatch.ElapsedMilliseconds}ms)");
+
+                _ = MonitorWidevineAsync(cef);
+                if (OperatingSystem.IsLinux() && !isHeadless)
+                    _ = LinuxSandbox.OfferAppArmorProfileAsync();
             }
             GrayjayServer server = null;
             JustCefWindow ? window = null;
@@ -444,7 +585,8 @@ namespace Grayjay.Desktop
                     title: "Grayjay",
                     iconPath: Utilities.FindFile("grayjay.png"),
                     appId: "com.futo.grayjay.desktop",
-                    fullscreen: isFullscreen
+                    fullscreen: isFullscreen,
+                    viewsEnabled: true
                 );
                 await window.SetModifyRequestsAsync(true, false);
                 if (scaleFactor != null && scaleFactor != 1.0)
@@ -731,8 +873,26 @@ namespace Grayjay.Desktop
             if (window != null)
             {
                 Logger.i(nameof(Program), "Main: Waiting for window exit.");
-                await window.WaitForExitAsync(cancellationTokenSource.Token);
-                Logger.i(nameof(Program), "Main: Window exited.");
+                var windowExitTask = window.WaitForExitAsync(cancellationTokenSource.Token);
+                try
+                {
+                    while (!windowExitTask.IsCompleted && cef != null && !cef.HasExited)
+                        await Task.WhenAny(windowExitTask, Task.Delay(250, cancellationTokenSource.Token));
+
+                    if (windowExitTask.IsCompleted)
+                    {
+                        await windowExitTask;
+                        Logger.i(nameof(Program), "Main: Window exited.");
+                    }
+                    else if (cef?.HasExited == true)
+                    {
+                        Logger.w(nameof(Program), "Main: Native browser process exited before the window close notification.");
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationTokenSource.IsCancellationRequested)
+                {
+                    Logger.i(nameof(Program), "Main: Window wait canceled during shutdown.");
+                }
             }
             else
             {
